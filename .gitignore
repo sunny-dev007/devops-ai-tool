@@ -3,6 +3,7 @@ node_modules/
 
 # Ephemeral Terraform workspaces & provider cache (large binaries)
 tmp/
+temp/
 .terraform/
 
 # macOS
