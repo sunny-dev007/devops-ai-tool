@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Ephemeral Terraform workspaces & provider cache (large binaries)
+tmp/
+.terraform/
+
+# macOS
+.DS_Store
+
+# Create React App build output (regenerate; may embed env values)
+client/build/
+
+# Local env (secrets)
+.env.local
+.env*.local
