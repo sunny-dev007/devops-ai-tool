@@ -1,7 +1,391 @@
 const { spawn } = require('child_process');
+const crypto = require('crypto');
 const fs = require('fs').promises;
 const path = require('path');
 const { normalizeLinuxRuntimeForAzCli } = require('./webAppRuntimeUtils');
+
+const AZURE_KEY_VAULT_RESOURCE_RE_TEST = /resource\s+"azurerm_key_vault"\s+"[^"]*"\s*\{/;
+
+/**
+ * Ensure root variable tenant_id exists (for Key Vault and similar).
+ */
+function ensureTerraformTenantVariable(hcl) {
+  if (/variable\s+"tenant_id"/.test(hcl)) return hcl;
+  return `variable "tenant_id" {
+  type        = string
+  description = "Azure AD tenant ID (from AZURE_TENANT_ID / app environment)"
+}
+
+${hcl}`;
+}
+
+/**
+ * Inject tenant_id into azurerm_key_vault blocks that omit it (non-interactive plan/apply).
+ */
+function injectKeyVaultTenantId(hcl, tenantExpr = 'var.tenant_id') {
+  const replacements = [];
+  let m;
+  const re = /resource\s+"azurerm_key_vault"\s+"[^"]*"\s*\{/g;
+  while ((m = re.exec(hcl)) !== null) {
+    const openBraceIdx = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = openBraceIdx + 1;
+    for (; i < hcl.length && depth > 0; i++) {
+      const c = hcl[i];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+    const inner = hcl.slice(openBraceIdx + 1, i - 1);
+    if (!/tenant_id\s*=/.test(inner)) {
+      replacements.push({ pos: openBraceIdx + 1, text: `\n  tenant_id = ${tenantExpr}\n` });
+    }
+  }
+  let out = hcl;
+  for (let j = replacements.length - 1; j >= 0; j--) {
+    const { pos, text } = replacements[j];
+    out = out.slice(0, pos) + text + out.slice(pos);
+  }
+  return out;
+}
+
+/**
+ * Inject required sku_name into azurerm_key_vault blocks (provider requires it).
+ */
+/**
+ * Key Vault names are globally unique in Azure; clone runs must avoid collisions and soft-deleted names.
+ */
+function azureKeyVaultUniqueName(hint) {
+  const cleaned = String(hint || 'kv')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+  let prefix = cleaned.slice(0, 6) || 'kv';
+  if (!/^[a-z]/.test(prefix)) {
+    prefix = (`k${prefix}`).slice(0, 6);
+  }
+  const rand = crypto.randomBytes(8).toString('hex');
+  return (prefix + rand).slice(0, 24);
+}
+
+function uniquifyAzurermKeyVaultNames(hcl) {
+  const re = /resource\s+"azurerm_key_vault"\s+"[^"]*"\s*\{/g;
+  const patches = [];
+  let m;
+  while ((m = re.exec(hcl)) !== null) {
+    const openIdx = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = openIdx + 1;
+    for (; i < hcl.length && depth > 0; i++) {
+      const c = hcl[i];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+    const inner = hcl.slice(openIdx + 1, i - 1);
+    const nameMatch = inner.match(/name\s*=\s*"([^"]*)"/);
+    if (!nameMatch) continue;
+    const newName = azureKeyVaultUniqueName(nameMatch[1]);
+    const newInner = inner.replace(/name\s*=\s*"[^"]*"/, `name                = "${newName}"`);
+    patches.push({ start: openIdx + 1, end: i - 1, newInner });
+  }
+  patches.sort((a, b) => b.start - a.start);
+  let out = hcl;
+  for (const p of patches) {
+    out = out.slice(0, p.start) + p.newInner + out.slice(p.end);
+  }
+  return out;
+}
+
+function injectKeyVaultSkuName(hcl, skuName = 'standard') {
+  const re = /resource\s+"azurerm_key_vault"\s+"[^"]*"\s*\{/g;
+  const patches = [];
+  let m;
+  while ((m = re.exec(hcl)) !== null) {
+    const openBraceIdx = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = openBraceIdx + 1;
+    for (; i < hcl.length && depth > 0; i++) {
+      const c = hcl[i];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+    const inner = hcl.slice(openBraceIdx + 1, i - 1);
+    if (/sku_name\s*=/.test(inner)) continue;
+    patches.push({ pos: openBraceIdx + 1, text: `\n  sku_name            = "${skuName}"\n` });
+  }
+  let out = hcl;
+  for (let j = patches.length - 1; j >= 0; j--) {
+    const { pos, text } = patches[j];
+    out = out.slice(0, pos) + text + out.slice(pos);
+  }
+  return out;
+}
+
+/**
+ * Remove invalid nested sku { } inside azurerm_static_web_app (azurerm 3/4 use sku_tier + sku_size, not sku blocks).
+ */
+function stripSkuNestedBlocksInString(inner) {
+  let tier = 'Standard';
+  let size = 'Standard';
+  let text = inner;
+  let guard = 0;
+  while (/\bsku\s*\{/.test(text) && guard++ < 30) {
+    const match = /\bsku\s*\{/.exec(text);
+    const start = match.index;
+    let depth = 1;
+    let i = start + match[0].length;
+    for (; i < text.length && depth > 0; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') depth--;
+    }
+    const blockText = text.slice(start, i);
+    const tM = blockText.match(/tier\s*=\s*"([^"]+)"/i);
+    const sM = blockText.match(/size\s*=\s*"([^"]+)"/i);
+    if (tM) {
+      tier = tM[1];
+      if (/free/i.test(tM[1])) {
+        tier = 'Free';
+        size = 'Free';
+      }
+    }
+    if (sM && !/^Free$/i.test(tier)) {
+      size = sM[1];
+    }
+    text = text.slice(0, start) + text.slice(i);
+  }
+  return { text, tier, size };
+}
+
+function fixStaticWebAppSkuBlocksForResource(hcl, resourceType) {
+  if (!resourceType || !/^[a-z0-9_]+$/i.test(resourceType)) return hcl;
+  const re = new RegExp(`resource\\s+"${resourceType}"\\s+"[^"]*"\\s*\\{`, 'g');
+  const patches = [];
+  let m;
+  while ((m = re.exec(hcl)) !== null) {
+    const openBraceIdx = m.index + m[0].length - 1;
+    let depth = 1;
+    let i = openBraceIdx + 1;
+    for (; i < hcl.length && depth > 0; i++) {
+      const c = hcl[i];
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+    }
+    const innerStart = openBraceIdx + 1;
+    const innerEnd = i - 1;
+    const inner = hcl.slice(innerStart, innerEnd);
+    if (!/\bsku\s*\{/.test(inner)) continue;
+    let { text: newInner, tier, size } = stripSkuNestedBlocksInString(inner);
+    if (!/\bsku_tier\s*=/.test(newInner)) {
+      newInner = `  sku_tier = "${tier}"\n  sku_size = "${size}"\n` + newInner.trimStart();
+    }
+    patches.push({ innerStart, innerEnd, newInner });
+  }
+  patches.sort((a, b) => b.innerStart - a.innerStart);
+  let out = hcl;
+  for (const p of patches) {
+    out = out.slice(0, p.innerStart) + p.newInner + out.slice(p.innerEnd);
+  }
+  return out;
+}
+
+const AZURE_STATIC_WEB_APP_RE_TEST = /resource\s+"azurerm_static_web_app"\s+"[^"]*"\s*\{/;
+const AZURE_STATIC_SITE_RE_TEST = /resource\s+"azurerm_static_site"\s+"[^"]*"\s*\{/;
+
+/**
+ * Terraform 1.x rejects (or warns then errors on) values in *.auto.tfvars* when the root module
+ * does not declare those variables. Generated HCL often uses var.x without a variable block.
+ */
+function ensureVariableBlocksForTfvarKeys(hcl, keys) {
+  if (!keys || !keys.length) return hcl;
+  const blocks = [];
+  for (const key of keys) {
+    if (!key || typeof key !== 'string') continue;
+    if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(key)) continue;
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`variable\\s+"${escaped}"`).test(hcl)) continue;
+    blocks.push(`variable "${key}" {\n  type = string\n}`);
+  }
+  if (blocks.length === 0) return hcl;
+  return `${blocks.join('\n\n')}\n\n${hcl}`;
+}
+
+/**
+ * LLM output often includes markdown fences (```hcl ... ```), which makes main.tf invalid for terraform init.
+ */
+function stripTerraformMarkdownWrappers(raw) {
+  if (raw == null) return '';
+  let s = String(raw).replace(/^\uFEFF/, '').trim();
+  if (!s) return s;
+
+  const idx = s.search(/```(?:hcl|terraform|tf)?\s*\r?\n/i);
+  if (idx > 0) {
+    s = s.slice(idx);
+  }
+
+  let guard = 0;
+  while (guard++ < 20 && /^```(?:hcl|terraform|tf)?\s*\r?\n?/i.test(s)) {
+    s = s.replace(/^```(?:hcl|terraform|tf)?\s*\r?\n?/i, '');
+  }
+  s = s.trim();
+  s = s.replace(/\r?\n```[ \t]*(?:\r?\n)?$/i, '').trim();
+  s = s.replace(/```[ \t]*$/i, '').trim();
+
+  const lines = s.split(/\r?\n/);
+  while (lines.length) {
+    const t = lines[0].trim();
+    if (/^`{1,3}(?:hcl|terraform|tf)`{0,3}$/i.test(t) || /^`hcl`$/i.test(t) || /^```\s*$/.test(t)) {
+      lines.shift();
+      continue;
+    }
+    break;
+  }
+  while (lines.length) {
+    const t = lines[lines.length - 1].trim();
+    if (/^```\s*$/.test(t) || /^`{1,3}\s*$/.test(t)) {
+      lines.pop();
+      continue;
+    }
+    break;
+  }
+  return lines.join('\n').trim();
+}
+
+/** Provider features: skip soft-deleted Key Vault recovery probe on create (saves provider round-trips; names are uniquified anyway). */
+const AZURERM_FEATURES_KEY_VAULT_CLONE = `features {
+    key_vault {
+      recover_soft_deleted_key_vaults = false
+    }
+  }`;
+
+/**
+ * azurerm requires an explicit provider block with mandatory features {} (even if empty).
+ */
+function getFirstAzurermProviderBlockInner(hcl) {
+  const re = /provider\s+"azurerm"\s*\{/g;
+  const m = re.exec(hcl);
+  if (!m) return null;
+  const openIdx = m.index + m[0].length - 1;
+  let depth = 1;
+  let i = openIdx + 1;
+  for (; i < hcl.length && depth > 0; i++) {
+    const c = hcl[i];
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+  }
+  const innerStart = openIdx + 1;
+  const innerEnd = i - 1;
+  return {
+    inner: hcl.slice(innerStart, innerEnd),
+    openBraceIdx: openIdx,
+    innerStart,
+    innerEnd
+  };
+}
+
+function enrichProviderInnerFeaturesKeyVaultRecoverFalse(providerInner) {
+  if (/recover_soft_deleted_key_vaults/.test(providerInner)) return providerInner;
+  if (/\bfeatures\s*\{\s*\}/.test(providerInner)) {
+    return providerInner.replace(/\bfeatures\s*\{\s*\}/, AZURERM_FEATURES_KEY_VAULT_CLONE);
+  }
+  if (/\bfeatures\s*\{/.test(providerInner) && !/\bkey_vault\s*\{/.test(providerInner)) {
+    return providerInner.replace(/\bfeatures\s*\{/, `features {
+    key_vault {
+      recover_soft_deleted_key_vaults = false
+    }
+
+`);
+  }
+  return providerInner;
+}
+
+function upgradeAzurermProviderFeaturesForKeyVaultCloneSpeed(hcl) {
+  const hit = getFirstAzurermProviderBlockInner(hcl);
+  if (!hit) return hcl;
+  const enriched = enrichProviderInnerFeaturesKeyVaultRecoverFalse(hit.inner);
+  if (enriched === hit.inner) return hcl;
+  return hcl.slice(0, hit.innerStart) + enriched + hcl.slice(hit.innerEnd);
+}
+
+function injectFeaturesIntoFirstAzurermProvider(hcl) {
+  const hit = getFirstAzurermProviderBlockInner(hcl);
+  if (!hit) return hcl;
+  const { openBraceIdx } = hit;
+  return `${hcl.slice(0, openBraceIdx + 1)}\n  features {\n    key_vault {\n      recover_soft_deleted_key_vaults = false\n    }\n  }\n${hcl.slice(openBraceIdx + 1)}`;
+}
+
+function ensureAzurermProviderAndFeatures(hcl) {
+  if (!hcl || typeof hcl !== 'string') return hcl;
+  const hit = getFirstAzurermProviderBlockInner(hcl);
+  if (!hit) {
+    const hasTerraformBlock = /terraform\s*\{/.test(hcl);
+    const prefix = hasTerraformBlock
+      ? `provider "azurerm" {
+  ${AZURERM_FEATURES_KEY_VAULT_CLONE}
+}
+
+`
+      : `terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 3.0.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  ${AZURERM_FEATURES_KEY_VAULT_CLONE}
+}
+
+`;
+    return prefix + hcl;
+  }
+  if (/\bfeatures\s*\{/.test(hit.inner)) {
+    return upgradeAzurermProviderFeaturesForKeyVaultCloneSpeed(hcl);
+  }
+  return injectFeaturesIntoFirstAzurermProvider(hcl);
+}
+
+/**
+ * Terraform azurerm defaults to Azure CLI auth; CLI may be logged into a different tenant than
+ * AZURE_TENANT_ID / the subscription (Key Vault then returns AKV10032 Invalid issuer).
+ * When full SP credentials exist, map AZURE_* → ARM_* and disable CLI in the provider block.
+ */
+function terraformServicePrincipalEnvPresent() {
+  const sub = process.env.AZURE_SUBSCRIPTION_ID || process.env.ARM_SUBSCRIPTION_ID;
+  const ten = process.env.AZURE_TENANT_ID || process.env.ARM_TENANT_ID;
+  const cid = process.env.AZURE_CLIENT_ID || process.env.ARM_CLIENT_ID;
+  const sec = process.env.AZURE_CLIENT_SECRET || process.env.ARM_CLIENT_SECRET;
+  return !!(
+    sub && String(sub).trim() &&
+    ten && String(ten).trim() &&
+    cid && String(cid).trim() &&
+    sec && String(sec).trim()
+  );
+}
+
+function buildTerraformArmProcessEnv(pluginCacheDir) {
+  const env = {
+    TF_PLUGIN_CACHE_DIR: pluginCacheDir,
+    ...(process.env.TF_IN_AUTOMATION ? {} : { TF_IN_AUTOMATION: '1' })
+  };
+  const sub = process.env.AZURE_SUBSCRIPTION_ID || process.env.ARM_SUBSCRIPTION_ID;
+  const ten = process.env.AZURE_TENANT_ID || process.env.ARM_TENANT_ID;
+  const cid = process.env.AZURE_CLIENT_ID || process.env.ARM_CLIENT_ID;
+  const sec = process.env.AZURE_CLIENT_SECRET || process.env.ARM_CLIENT_SECRET;
+  if (sub && String(sub).trim()) env.ARM_SUBSCRIPTION_ID = String(sub).trim();
+  if (ten && String(ten).trim()) env.ARM_TENANT_ID = String(ten).trim();
+  if (cid && String(cid).trim()) env.ARM_CLIENT_ID = String(cid).trim();
+  if (sec && String(sec).trim()) env.ARM_CLIENT_SECRET = String(sec).trim();
+  return env;
+}
+
+function injectAzurermProviderDisableCliWhenUsingServicePrincipalEnv(hcl) {
+  if (!terraformServicePrincipalEnvPresent()) return hcl;
+  const hit = getFirstAzurermProviderBlockInner(hcl);
+  if (!hit) return hcl;
+  if (/\buse_cli\s*=/.test(hit.inner)) return hcl;
+  const { openBraceIdx } = hit;
+  return `${hcl.slice(0, openBraceIdx + 1)}\n  use_cli             = false\n${hcl.slice(openBraceIdx + 1)}`;
+}
 
 /**
  * Execution Service for Running Azure CLI Commands and Terraform
@@ -533,17 +917,121 @@ class ExecutionService {
       const tmpDir = path.join(__dirname, '..', 'tmp', sessionId);
       await fs.mkdir(tmpDir, { recursive: true });
       
-      // Write terraform configuration
+      // Resolve tenant ID from request options or app .env (dotenv loads AZURE_TENANT_ID for the server)
+      const tenantId = String(
+        options.tenantId || process.env.AZURE_TENANT_ID || process.env.TENANT_ID || ''
+      ).trim();
+
+      let tfBody = stripTerraformMarkdownWrappers(terraformConfig);
+      if (tfBody !== String(terraformConfig).replace(/^\uFEFF/, '').trim()) {
+        console.log('📝 Stripped markdown wrappers from Terraform config before init');
+      }
+      const beforeProvider = tfBody;
+      tfBody = ensureAzurermProviderAndFeatures(tfBody);
+      if (tfBody !== beforeProvider) {
+        console.log('📝 Ensured provider "azurerm" with features (and required_providers if missing)');
+      }
+      const beforeUseCli = tfBody;
+      tfBody = injectAzurermProviderDisableCliWhenUsingServicePrincipalEnv(tfBody);
+      if (tfBody !== beforeUseCli) {
+        console.log('📝 Provider azurerm: use_cli = false (authenticating with ARM_* from app environment, correct tenant for Key Vault)');
+      } else if (terraformServicePrincipalEnvPresent() && !getFirstAzurermProviderBlockInner(tfBody)) {
+        console.warn('⚠️ AZURE_* credentials are set but HCL has no provider "azurerm" block — add one or Terraform may use Azure CLI (wrong tenant → AKV10032)');
+      }
+      const beforeFeatTuning = tfBody;
+      tfBody = upgradeAzurermProviderFeaturesForKeyVaultCloneSpeed(tfBody);
+      if (tfBody !== beforeFeatTuning) {
+        console.log('📝 Provider features: key_vault.recover_soft_deleted_key_vaults = false (fewer provider checks on create)');
+      }
+      const hasKeyVault = AZURE_KEY_VAULT_RESOURCE_RE_TEST.test(tfBody);
+      const hasStaticWebApp =
+        AZURE_STATIC_WEB_APP_RE_TEST.test(tfBody) || AZURE_STATIC_SITE_RE_TEST.test(tfBody);
+
+      if (hasStaticWebApp) {
+        const beforeSw = tfBody;
+        tfBody = fixStaticWebAppSkuBlocksForResource(tfBody, 'azurerm_static_web_app');
+        tfBody = fixStaticWebAppSkuBlocksForResource(tfBody, 'azurerm_static_site');
+        if (tfBody !== beforeSw) {
+          console.log('📝 Static Web App resource(s): replaced invalid sku { } blocks with sku_tier / sku_size');
+        }
+      }
+
+      if (hasKeyVault) {
+        const beforeKvSku = tfBody;
+        tfBody = injectKeyVaultSkuName(tfBody, 'standard');
+        if (tfBody !== beforeKvSku) {
+          console.log('📝 Key Vault: injected default sku_name where missing');
+        }
+      }
+
+      if (hasKeyVault && tenantId) {
+        tfBody = ensureTerraformTenantVariable(tfBody);
+        tfBody = injectKeyVaultTenantId(tfBody, 'var.tenant_id');
+        console.log('📝 Key Vault blocks: ensured variable tenant_id and tenant_id argument (from AZURE_TENANT_ID)');
+      } else if (hasKeyVault && !tenantId) {
+        console.warn('⚠️ Terraform has azurerm_key_vault but AZURE_TENANT_ID (or TENANT_ID) is not set in the server environment — plan may fail on tenant_id');
+      }
+
+      if (hasKeyVault) {
+        const beforeKvName = tfBody;
+        tfBody = uniquifyAzurermKeyVaultNames(tfBody);
+        if (tfBody !== beforeKvName) {
+          console.log('📝 Key Vault: applied globally unique name(s) to avoid VaultAlreadyExists');
+        }
+      }
+
+      // Non-interactive runs cannot answer prompts; supply root module variables the generator expects
+      // (see aiAgentService.generateTerraformConfig — target_resource_group_name + location + tenant_id).
+      const tfvars = {
+        ...(options.terraformVars && typeof options.terraformVars === 'object' && !Array.isArray(options.terraformVars)
+          ? options.terraformVars
+          : {})
+      };
+      if (options.targetResourceGroupName != null && String(options.targetResourceGroupName).trim() !== '') {
+        tfvars.target_resource_group_name = String(options.targetResourceGroupName).trim();
+      }
+      if (options.location != null && String(options.location).trim() !== '') {
+        tfvars.location = String(options.location).trim();
+      }
+      if (tenantId && /variable\s+"tenant_id"/.test(tfBody) && !Object.prototype.hasOwnProperty.call(tfvars, 'tenant_id')) {
+        tfvars.tenant_id = tenantId;
+      }
+
+      // Must run after tfvars keys are known: declare any variable that appears in auto.tfvars but is missing in HCL
+      const tfvarKeyList = Object.keys(tfvars);
+      if (tfvarKeyList.length > 0) {
+        const before = tfBody;
+        tfBody = ensureVariableBlocksForTfvarKeys(tfBody, tfvarKeyList);
+        if (tfBody !== before) {
+          const added = tfvarKeyList.filter((k) => {
+            const esc = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            return !new RegExp(`variable\\s+"${esc}"`).test(before);
+          });
+          console.log(`📝 Injected missing variable block(s): ${added.join(', ')}`);
+        }
+      }
+
+      // Write terraform configuration (after all HCL fixes)
       const tfFile = path.join(tmpDir, 'main.tf');
-      await fs.writeFile(tfFile, terraformConfig);
+      await fs.writeFile(tfFile, tfBody);
+
+      if (Object.keys(tfvars).length > 0) {
+        const tfvarsPath = path.join(tmpDir, 'terraform.auto.tfvars.json');
+        await fs.writeFile(tfvarsPath, JSON.stringify(tfvars, null, 2), 'utf8');
+        console.log(`📝 Wrote ${path.basename(tfvarsPath)} (${Object.keys(tfvars).join(', ')})`);
+      }
       
       console.log(`🚀 Starting Terraform execution: ${sessionId}`);
       console.log(`   Working directory: ${tmpDir}`);
+
+      const pluginCacheDir = path.join(__dirname, '..', '.terraform-plugin-cache');
+      await fs.mkdir(pluginCacheDir, { recursive: true });
+      const tfExecEnv = buildTerraformArmProcessEnv(pluginCacheDir);
       
       // Step 1: terraform init
       let step = {
         index: 1,
-        command: 'terraform init',
+        command: 'terraform init -input=false -no-color',
         status: 'running',
         output: '',
         error: '',
@@ -552,7 +1040,7 @@ class ExecutionService {
       execution.steps.push(step);
       
       console.log('📝 Step 1: terraform init');
-      let result = await this.runCommand('terraform init', { cwd: tmpDir });
+      let result = await this.runCommand('terraform init -input=false -no-color', { cwd: tmpDir, env: tfExecEnv });
       step.status = result.code === 0 ? 'completed' : 'failed';
       step.output = result.output;
       step.error = result.error;
@@ -567,10 +1055,10 @@ class ExecutionService {
       
       console.log('✅ Step 1 completed');
       
-      // Step 2: terraform plan
+      // Step 2: terraform plan — refresh=false (no remote refresh), lock=false (ephemeral dir), parallelism, no-color
       step = {
         index: 2,
-        command: 'terraform plan',
+        command: 'terraform plan -refresh=false -lock=false -parallelism=32 -no-color -out=tfplan',
         status: 'running',
         output: '',
         error: '',
@@ -579,7 +1067,10 @@ class ExecutionService {
       execution.steps.push(step);
       
       console.log('📝 Step 2: terraform plan');
-      result = await this.runCommand('terraform plan -out=tfplan', { cwd: tmpDir });
+      result = await this.runCommand(
+        'terraform plan -refresh=false -input=false -lock=false -parallelism=32 -no-color -out=tfplan',
+        { cwd: tmpDir, env: tfExecEnv }
+      );
       step.status = result.code === 0 ? 'completed' : 'failed';
       step.output = result.output;
       step.error = result.error;
@@ -598,7 +1089,7 @@ class ExecutionService {
       if (!options.dryRun) {
         step = {
           index: 3,
-          command: 'terraform apply',
+          command: 'terraform apply -auto-approve -parallelism=32 -no-color tfplan',
           status: 'running',
           output: '',
           error: '',
@@ -607,7 +1098,10 @@ class ExecutionService {
         execution.steps.push(step);
         
         console.log('📝 Step 3: terraform apply');
-        result = await this.runCommand('terraform apply -auto-approve tfplan', { cwd: tmpDir });
+        result = await this.runCommand(
+          'terraform apply -auto-approve -input=false -parallelism=32 -no-color tfplan',
+          { cwd: tmpDir, env: tfExecEnv }
+        );
         step.status = result.code === 0 ? 'completed' : 'failed';
         step.output = result.output;
         step.error = result.error;
@@ -657,7 +1151,7 @@ class ExecutionService {
       const childProcess = spawn(command, {
         shell: true,
         cwd: options.cwd || process.cwd(),
-        env: { ...process.env },
+        env: { ...process.env, ...(options.env || {}) },
         stdio: ['ignore', 'pipe', 'pipe']
       });
       
@@ -1971,6 +2465,7 @@ done
 
 // Cleanup old executions every 30 minutes
 const executionService = new ExecutionService();
+executionService.stripTerraformMarkdownWrappers = stripTerraformMarkdownWrappers;
 setInterval(() => {
   executionService.cleanup();
 }, 30 * 60 * 1000);

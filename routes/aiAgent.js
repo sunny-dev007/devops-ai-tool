@@ -442,11 +442,12 @@ router.post('/generate-terraform', async (req, res) => {
       targetResourceGroupName,
       validatedConfig
     );
+    const terraformClean = executionService.stripTerraformMarkdownWrappers(terraformConfig);
     
     res.json({
       success: true,
       data: {
-        terraform: terraformConfig,
+        terraform: terraformClean,
         filename: `${targetResourceGroupName}-clone.tf`
       }
     });
@@ -757,7 +758,14 @@ router.post('/execute-cli', async (req, res) => {
 // Execute Terraform configuration
 router.post('/execute-terraform', async (req, res) => {
   try {
-    const { terraform, options } = req.body;
+    const { terraform, options: optionsBody, targetResourceGroupName, location, tenantId, terraformVars } = req.body;
+    const options = { ...(optionsBody || {}) };
+    if (targetResourceGroupName !== undefined) options.targetResourceGroupName = targetResourceGroupName;
+    if (location !== undefined) options.location = location;
+    if (tenantId !== undefined) options.tenantId = tenantId;
+    if (terraformVars !== undefined && typeof terraformVars === 'object' && terraformVars !== null && !Array.isArray(terraformVars)) {
+      options.terraformVars = { ...(options.terraformVars || {}), ...terraformVars };
+    }
     
     if (!terraform) {
       return res.status(400).json({
@@ -771,7 +779,7 @@ router.post('/execute-terraform', async (req, res) => {
     console.log(`🚀 Starting Terraform execution: ${sessionId}`);
     
     // Start execution in background
-    executionService.executeTerraform(sessionId, terraform, options || {})
+    executionService.executeTerraform(sessionId, terraform, options)
       .catch(error => {
         console.error(`❌ Execution ${sessionId} failed:`, error.message);
       });

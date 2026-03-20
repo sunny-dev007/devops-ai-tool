@@ -68,6 +68,8 @@ const AIAgent = () => {
   const chatEndRef = useRef(null);
   const shownLongRunningWarning = useRef(false);
   const executionStartTime = useRef(null);
+  /** Avoid re-rendering the execution modal every poll tick when nothing changed (reduces "loading" churn during long plan/apply). */
+  const lastExecutionPollSigRef = useRef(null);
   
   // Operations tab state
   const [activeTab, setActiveTab] = useState('chat'); // 'chat', 'operations', or 'cost-analyzer'
@@ -471,13 +473,27 @@ const AIAgent = () => {
     );
     
     if (!confirmed) return;
+
+    const tfLocation = discoveredResources?.resourceGroup?.location;
+    if (!targetResourceGroup?.trim() || !tfLocation) {
+      toast.error('Target resource group and discovered source location are required for Terraform.');
+      setChatMessages(prev => [...prev, {
+        role: 'assistant',
+        content: '❌ Terraform execution needs the target resource group name and the source resource group location (re-run discovery / analysis if location is missing).'
+      }]);
+      return;
+    }
     
     try {
       toast.loading('Starting Terraform execution...', { id: 'execute-tf' });
       
       const response = await axios.post('/api/ai-agent/execute-terraform', {
         terraform: generatedScripts.terraform.terraform,
-        options: { dryRun: false }
+        options: {
+          dryRun: false,
+          targetResourceGroupName: targetResourceGroup.trim(),
+          location: tfLocation
+        }
       });
       
       if (response.data.success) {
@@ -510,17 +526,36 @@ const AIAgent = () => {
    * Start polling for execution status
    */
   const startExecutionPolling = (sessionId) => {
+    lastExecutionPollSigRef.current = null;
+    const executionPollSignature = (data) => {
+      if (!data) return '';
+      const steps = data.steps || [];
+      return [
+        data.status,
+        data.type,
+        steps.length,
+        ...steps.map(
+          (s) =>
+            `${s.index}:${s.status}:${s.duration ?? ''}:${(s.output || '').length}:${(s.error || '').length}`
+        )
+      ].join('|');
+    };
     const pollInterval = setInterval(async () => {
       try {
         const response = await axios.get(`/api/ai-agent/execution-status/${sessionId}`);
         
         if (response.data.success) {
-          setExecutionData(response.data.data);
+          const payload = response.data.data;
+          const sig = executionPollSignature(payload);
+          if (sig !== lastExecutionPollSigRef.current) {
+            lastExecutionPollSigRef.current = sig;
+            setExecutionData(payload);
+          }
           
           // Check for interactive prompt (waiting for user input)
-          if (response.data.data.status === 'waiting_for_input' && response.data.data.interactivePrompt) {
-            console.log('🔔 Interactive prompt detected:', response.data.data.interactivePrompt);
-            setInteractivePrompt(response.data.data.interactivePrompt);
+          if (payload.status === 'waiting_for_input' && payload.interactivePrompt) {
+            console.log('🔔 Interactive prompt detected:', payload.interactivePrompt);
+            setInteractivePrompt(payload.interactivePrompt);
             setShowInteractivePrompt(true);
             
             // Notify user
@@ -534,24 +569,26 @@ const AIAgent = () => {
           }
           
           // Stop polling if execution is complete
-          if (response.data.data.status === 'completed' || response.data.data.status === 'failed' || response.data.data.status === 'cancelled' || response.data.data.status === 'completed_with_warnings') {
+          if (payload.status === 'completed' || payload.status === 'failed' || payload.status === 'cancelled' || payload.status === 'completed_with_warnings') {
+            lastExecutionPollSigRef.current = executionPollSignature(payload);
+            setExecutionData(payload);
             clearInterval(pollInterval);
             setExecutionPolling(null);
             
-            if (response.data.data.status === 'completed' || response.data.data.status === 'completed_with_warnings') {
+            if (payload.status === 'completed' || payload.status === 'completed_with_warnings') {
               toast.success('Execution completed successfully!');
-              const warningText = response.data.data.warnings?.length 
-                ? `\n\n⚠️ Warnings:\n${response.data.data.warnings.map(w => `• ${w.message}`).join('\n')}`
+              const warningText = payload.warnings?.length 
+                ? `\n\n⚠️ Warnings:\n${payload.warnings.map(w => `• ${w.message}`).join('\n')}`
                 : '';
               setChatMessages(prev => [...prev, {
                 role: 'assistant',
-                content: `🎉 Execution completed ${response.data.data.status === 'completed_with_warnings' ? 'with warnings' : 'successfully'}!\n\nYour resources have been cloned to "${targetResourceGroup}".\n\nDuration: ${(response.data.data.duration / 1000).toFixed(1)}s${warningText}\n\nYou can now verify the resources in Azure Portal.`
+                content: `🎉 Execution completed ${payload.status === 'completed_with_warnings' ? 'with warnings' : 'successfully'}!\n\nYour resources have been cloned to "${targetResourceGroup}".\n\nDuration: ${(payload.duration / 1000).toFixed(1)}s${warningText}\n\nYou can now verify the resources in Azure Portal.`
               }]);
-            } else if (response.data.data.status === 'failed') {
+            } else if (payload.status === 'failed') {
               toast.error('Execution failed - Analyzing error...');
               
               // Trigger AI error analysis for cloning failures
-              analyzeCloningingError(response.data.data);
+              analyzeCloningingError(payload);
             }
           }
         }
@@ -562,7 +599,7 @@ const AIAgent = () => {
           setExecutionPolling(null);
         }
       }
-    }, 2000); // Poll every 2 seconds
+    }, 4000); // Poll every 4s — plan/apply are long-running; lighter polling + signature check reduces UI churn
     
     setExecutionPolling(pollInterval);
   };

@@ -373,7 +373,7 @@ CRITICAL REQUIREMENTS:
 7. Add comments for clarity
 8. Ensure idempotency
 
-OUTPUT FORMAT: Provide only valid Terraform code, no markdown formatting.`;
+OUTPUT FORMAT: Provide only valid Terraform HCL. Do not wrap the code in markdown — no triple backticks, no \`\`\`hcl, no prose before or after the configuration.`;
 
       const userPrompt = `Generate Terraform configuration to clone the following Azure resource group and all its resources:
 
@@ -392,17 +392,66 @@ Generate complete Terraform configuration that:
 3. Properly handles resource dependencies (use depends_on if needed)
 4. Includes all necessary properties and settings
 5. Uses appropriate azurerm resource blocks for each resource type
-6. Includes provider configuration
-7. Uses variables for resource group name and location
+6. Includes a root terraform { required_providers { azurerm { source = "hashicorp/azurerm" version = ">= 3.0.0" } } } block AND provider "azurerm" { features {} } — features is mandatory (use an empty features {} block unless you need feature flags)
+7. Uses variables for resource group name, location, and Azure AD tenant ID (variable "tenant_id")
 8. Adds outputs for created resources
+9. For EVERY azurerm_key_vault resource you MUST set tenant_id = var.tenant_id AND sku_name = "standard" or "premium" (sku_name is required; use "premium" only if the source vault SKU was Premium)
+10. Use azurerm_static_web_app instead of deprecated azurerm_static_site for Static Web Apps
+
+AZURERM SCHEMA (hashicorp/azurerm 3.x / 4.x) — do not guess App Service or Cosmos-style blocks:
+- azurerm_static_web_app: there is NO nested "sku { }" block. Use only top-level sku_tier and sku_size (both strings). Examples: Free tier → sku_tier = "Free" and sku_size = "Free"; Standard → sku_tier = "Standard" and sku_size = "Standard". Never emit a sku { tier = ... } block inside this resource.
+- azurerm_key_vault: required arguments include name, location, resource_group_name, tenant_id, sku_name (typically "standard"). The name must be globally unique across all of Azure (3–24 chars, alphanumeric and hyphens); prefer a short prefix plus a long random suffix (e.g. kv + 12+ random hex digits) so clones never hit VaultAlreadyExists or soft-deleted name conflicts. ARM provisioning often takes several minutes — that is normal Azure latency, not Terraform. For faster applies, keep the vault minimal: omit certificate_contacts, avoid large access_policy blocks unless required, and do not set network_acls default_action = "Deny" unless the source truly used that (Deny can slow follow-up API calls).
+
+When cloning, map each resource in the JSON to the correct azurerm_* resource type and only use arguments that exist on that resource in the current provider.
 
 IMPORTANT: The Terraform configuration MUST actually CREATE all resources.
 DO NOT use data sources only. Use resource blocks to create new resources.
 
-Example structure:
+Declare these root variables in the same file (Terraform 1.x requires a variable block for every name used as var.* and for every key in auto.tfvars):
+variable "target_resource_group_name" { type = string }
+variable "location" { type = string }
+variable "tenant_id" { type = string description = "Azure AD tenant ID" }
+Never reference var.target_resource_group_name, var.location, or var.tenant_id without its matching variable block above.
+
+Example structure (always start the file with this before resources):
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = ">= 3.0.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {
+    key_vault {
+      recover_soft_deleted_key_vaults = false
+    }
+  }
+  # Execution may inject use_cli = false when the server has AZURE_CLIENT_ID/SECRET/TENANT/SUBSCRIPTION (fixes Key Vault AKV10032 vs Azure CLI default tenant)
+}
+
 resource "azurerm_resource_group" "target" {
   name     = var.target_resource_group_name
   location = var.location
+}
+
+resource "azurerm_key_vault" "example" {
+  name                = "<globally-unique-name>"
+  location            = azurerm_resource_group.target.location
+  resource_group_name = azurerm_resource_group.target.name
+  tenant_id           = var.tenant_id
+  sku_name            = "standard"
+  # ... access policies, network rules, etc.
+}
+
+resource "azurerm_static_web_app" "example" {
+  name                = "<globally-unique-name>"
+  resource_group_name = azurerm_resource_group.target.name
+  location            = azurerm_resource_group.target.location
+  sku_tier            = "Standard"
+  sku_size            = "Standard"
 }
 
 resource "azurerm_storage_account" "cloned" {
